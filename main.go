@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"hn"
@@ -32,7 +34,7 @@ func main() {
 func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		stories, err := getTopStories(numStories)
+		stories, err := getCachedStories(numStories)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -49,6 +51,27 @@ func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 	})
 }
 
+var (
+	cache           []item
+	cacheExpiration time.Time
+	cacheMutex      sync.Mutex
+)
+
+func getCachedStories(numStories int) ([]item, error) {
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
+	if time.Now().Sub(cacheExpiration) < 0 {
+		return cache, nil
+	}
+	stories, err := getTopStories(numStories)
+	if err != nil {
+		return nil, err
+	}
+	cache = stories
+	cacheExpiration = time.Now().Add(1 * time.Second)
+	return cache, nil
+}
+
 func getTopStories(numStories int) ([]item, error) {
 	var client hn.Client
 	ids, err := client.TopItems()
@@ -56,32 +79,53 @@ func getTopStories(numStories int) ([]item, error) {
 		return nil, errors.New("Failed to load top stories")
 	}
 	var stories []item
-	for _, id := range ids {
-		type result struct {
-			item item
-			err  error
-		}
-		resultCh := make(chan result)
-		go func(id int) {
+	at := 0
+	for len(stories) < numStories {
+		need := (numStories - len(stories)) * 5 / 4
+		stories = append(stories, getStories(ids[at:at+need])...)
+		at += need
+	}
+	return stories[:numStories], nil
+}
+
+func getStories(ids []int) []item {
+	type result struct {
+		item item
+		err  error
+		idx  int
+	}
+	resultCh := make(chan result)
+	// want := len(ids) * 5 / 4
+	for i := 0; i < len(ids); i++ {
+		go func(idx, id int) {
+			var client hn.Client
 			hnItem, err := client.GetItem(id)
 			if err != nil {
-				resultCh <- result{err: err}
+				resultCh <- result{idx: idx, err: err}
 			}
-			resultCh <- result{item: parseHNItem(hnItem)}
-		}(id)
-
-		res := <-resultCh
+			resultCh <- result{idx: idx, item: parseHNItem(hnItem)}
+		}(i, ids[i])
+	}
+	var results []result
+	for i := 0; i < len(ids); i++ {
+		results = append(results, <-resultCh)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].idx < results[j].idx
+	})
+	var stories []item
+	for _, res := range results {
 		if res.err != nil {
 			continue
 		}
 		if isStoryLink(res.item) {
 			stories = append(stories, res.item)
-			if len(stories) >= numStories {
+			if len(stories) >= len(ids) {
 				break
 			}
 		}
 	}
-	return stories, nil
+	return stories
 }
 
 func isStoryLink(item item) bool {
